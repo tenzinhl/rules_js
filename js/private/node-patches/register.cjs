@@ -47,10 +47,12 @@ if (
     }
     patchfs(fs, roots)
 
-    
-    // TENZIN: module.register the ESM hooks
-    module.register('./esm_hooks.mjs', pathToFileURL(__filename))
-    
+
+    // Register ESM hooks if module.register is available (Node.js 18.20+, maybe in earlier versions too)
+    if (typeof module.register === 'function') {
+        module.register('./esm_hooks.mjs', pathToFileURL(__filename))
+    }
+
     // Sync the esm modules to use the now patched fs cjs module.
     // See: https://nodejs.org/api/esm.html#builtin-modules
     module.syncBuiltinESMExports()
