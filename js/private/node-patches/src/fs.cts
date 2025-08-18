@@ -42,7 +42,7 @@ const { getStatsFromBinding } = require('internal/fs/utils');
 const internalFs = internalBinding('fs');
 const _originalStatFs = internalFs.lstat;
 
-export function patcher(fs: any = _fs, roots: string[]) {
+export function patcher(fs: any = _fs, roots: string[], useLstatPatch: boolean) {
     fs = fs || _fs
     // Make the original version of the library available for when access to the
     // unguarded file system is necessary, such as the esbuild plugin that
@@ -912,7 +912,7 @@ export function patcher(fs: any = _fs, roots: string[]) {
         }
     }
 
-    if (internalFs.lstat) {
+    if (useLstatPatch && internalFs.lstat) {
         internalFs.lstat = function (path, bigint, reqCallback, throwIfNoEntry) {
             // This is the nasty part.. — but I didn't spend much time thinking on this. I do think it's acceptable though.
             // Better than escaping IMO
