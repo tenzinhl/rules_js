@@ -36,6 +36,12 @@ const HOP_NOT_FOUND = Symbol.for('HOP NOT FOUND')
 
 type HopResults = string | typeof HOP_NON_LINK | typeof HOP_NOT_FOUND
 
+// TENZIN IMPORT SECTION
+const { internalBinding } = require('internal/test/binding');
+const { getStatsFromBinding } = require('internal/fs/utils');
+const internalFs = internalBinding('fs');
+const _originalStatFs = internalFs.lstat;
+
 export function patcher(fs: any = _fs, roots: string[]) {
     fs = fs || _fs
     // Make the original version of the library available for when access to the
@@ -816,6 +822,136 @@ export function patcher(fs: any = _fs, roots: string[]) {
             ) {
                 // this hop takes us out of the guard
                 return loc
+            }
+        }
+    }
+
+    // TENZIN PATCH SECTION FOR NODE INTERNAL LSTAT BINDING
+    // Almost same logic as existing patcher, just that we use `getStatsFromBinding`.
+    const eeguardStats = (path, bigint, stats, cb) => {
+        const statsObj = getStatsFromBinding(stats);
+        if (!statsObj.isSymbolicLink()) {
+            // the file is not a symbolic link so there is nothing more to do
+            return cb(null, stats)
+        }
+
+        path = resolvePathLike(path)
+        if (!canEscape(path)) {
+            // the file can not escaped the sandbox so there is nothing more to do
+            return cb(null, stats);
+        }
+
+        return guardedReadLink(path, (str) => {
+            if (str != path) {
+                // there are one or more hops within the guards so there is nothing more to do
+                return cb(null, stats);
+            }
+            // there are no hops so lets report the stats of the real file;
+            // we can't use origRealPath here since that function calls lstat internally
+            // which can result in an infinite loop
+            return unguardedRealPath(path, (err, str) => {
+                if (err) {
+                    if ('code' in err && err.code === 'ENOENT') {
+                        // broken link so there is nothing more to do
+                        return cb(null, stats);
+                    }
+                    return cb(err);
+                }
+
+                // Forward request to original callback.
+                const req2 = new internalFs.FSReqCallback(bigint);
+                req2.oncomplete = (err, realStats) => cb(err, realStats);
+                return _originalStatFs.call(internalFs, str, bigint, req2);
+            })
+        })
+    }
+
+    // Almost same logic as existing patcher, just that we use `getStatsFromBinding`.
+    const eeguardStatsSync = (path, bigint, throwIfNoEntry, stats) => {
+        // No stats available.
+        if (!stats) {
+            return stats
+        }
+
+        const statsObj = getStatsFromBinding(stats);
+        if (!statsObj.isSymbolicLink()) {
+            // the file is not a symbolic link so there is nothing more to do
+            return stats
+        }
+
+        path = resolvePathLike(path)
+        if (!canEscape(path)) {
+            // the file can not escaped the sandbox so there is nothing more to do
+            return stats
+        }
+
+        const guardedReadLink = guardedReadLinkSync(path);
+        if (guardedReadLink != path) {
+            // there are one or more hops within the guards so there is nothing more to do
+            return stats
+        }
+        try {
+            path = unguardedRealPathSync(path);
+
+            // there are no hops so lets report the stats of the real file;
+            // we can't use origRealPathSync here since that function calls lstat internally
+            // which can result in an infinite loop
+            return _originalStatFs.call(
+                internalFs,
+                path,
+                bigint,
+                undefined,
+                throwIfNoEntry
+            );
+        } catch (err) {
+            if (err.code === 'ENOENT') {
+                // broken link so there is nothing more to do
+                return stats;
+            }
+            throw err;
+        }
+    }
+
+    if (internalFs.lstat) {
+        internalFs.lstat = function (path, bigint, reqCallback, throwIfNoEntry) {
+            // This is the nasty part.. — but I didn't spend much time thinking on this. I do think it's acceptable though.
+            // Better than escaping IMO
+            const st = new Error().stack;
+            const needsGuarding =
+                st.includes('finalizeResolution (node:internal/modules/esm/resolve') && !st.includes('eeguardStats');
+            if (!needsGuarding || global.__insidePatchedLstat) {
+                return _originalStatFs
+                    .call(internalFs, path, bigint, reqCallback, throwIfNoEntry);
+            }
+
+            if (typeof reqCallback === 'symbol') {
+                return _originalStatFs
+                    .call(internalFs, path, bigint, reqCallback, throwIfNoEntry)
+                    .then((stats) => {
+                        return new Promise((resolve, reject) => {
+                            eeguardStats(path, bigint, stats, (err, guardedStats) => {
+                                err ? reject(err) : resolve(guardedStats)
+                            });
+                        });
+                    });
+            } else if (reqCallback !== undefined) {
+                // Just re-use the promise path above.
+                internalFs
+                    .lstat(path, bigint, internalFs.kUsePromises, throwIfNoEntry)
+                    .then((stats) => reqCallback(null, stats))
+                    .catch((err) => reqCallback(err));
+            } else {
+                const stats = _originalStatFs.call(
+                    internalFs,
+                    path,
+                    bigint,
+                    undefined,
+                    throwIfNoEntry
+                );
+                if (!stats) {
+                    return stats
+                }
+                return eeguardStatsSync(path, bigint, throwIfNoEntry, stats);
             }
         }
     }
