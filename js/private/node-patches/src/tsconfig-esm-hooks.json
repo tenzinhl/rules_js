@@ -1,0 +1,8 @@
+{
+    "compilerOptions": {
+        "module": "nodenext",
+        "target": "es2017",
+        "types": ["node"]
+    },
+    "include": ["esm_hooks.mts"]
+}

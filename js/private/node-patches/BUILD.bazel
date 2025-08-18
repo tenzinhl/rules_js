@@ -4,10 +4,12 @@ write_source_files(
     name = "checked_in_compile",
     files = {
         "fs.cjs": "//js/private/node-patches/src:fs-generated.cjs",
+        "esm_hooks.mjs": "//js/private/node-patches/src:esm_hooks-generated.mjs",
     },
 )
 
 exports_files([
     "fs.cjs",
+    "esm_hooks.mjs",
     "register.cjs",
 ])

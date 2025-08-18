@@ -37,6 +37,8 @@ if (
 ) {
     const fs = require('node:fs')
     const module = require('node:module')
+    const { pathToFileURL } = require('node:url')
+
     const roots = JS_BINARY__FS_PATCH_ROOTS.split(':')
     if (JS_BINARY__LOG_DEBUG) {
         console.error(
@@ -45,6 +47,10 @@ if (
     }
     patchfs(fs, roots)
 
+    
+    // TENZIN: module.register the ESM hooks
+    module.register('./esm_hooks.mjs', pathToFileURL(__filename))
+    
     // Sync the esm modules to use the now patched fs cjs module.
     // See: https://nodejs.org/api/esm.html#builtin-modules
     module.syncBuiltinESMExports()
