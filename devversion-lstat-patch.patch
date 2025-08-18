@@ -1,19 +1,63 @@
+diff --git a/devversion-lstat-patch.patch b/devversion-lstat-patch.patch
+new file mode 100644
+index 00000000..e69de29b
+diff --git a/js/private/js_binary.bzl b/js/private/js_binary.bzl
+index a059ad10..5d770bf8 100644
+--- a/js/private/js_binary.bzl
++++ b/js/private/js_binary.bzl
+@@ -204,6 +204,15 @@ _ATTRS = {
+         which can lead to non-hermetic behavior.""",
+         default = True,
+     ),
++    "use_lstat_patch": attr.bool(
++        doc = """Apply the internal lstat patch to prevent the program from following symlinks out of
++        the execroot, runfiles and the sandbox even when using the ESM loader.
++
++        This flag only has an effect when `patch_node_fs` is True.
++
++        This attribute was added by us (AugmentCode) as a fix for the ESM loader skirting the fs patches.""",
++        default = False,
++    ),
+     "include_sources": attr.bool(
+         doc = """When True, `sources` from `JsInfo` providers in `data` targets are included in the runfiles of the target.""",
+         default = True,
+@@ -564,11 +573,18 @@ def _create_launcher(ctx, log_prefix_rule_set, log_prefix_rule, fixed_args = [],
+     )
+ 
+ def _js_binary_impl(ctx):
++    # Only apply lstat patch if it's requested
++    JS_BINARY__USE_LSTAT_PATCH = "1" if ctx.attr.use_lstat_patch else "0"
++    fixed_env = {
++        "JS_BINARY__USE_LSTAT_PATCH": JS_BINARY__USE_LSTAT_PATCH,
++    }
++
+     launcher = _create_launcher(
+         ctx,
+         log_prefix_rule_set = "aspect_rules_js",
+         log_prefix_rule = "js_test" if ctx.attr.testonly else "js_binary",
+         fixed_args = ctx.attr.fixed_args,
++        fixed_env = fixed_env,
+     )
+     runfiles = launcher.runfiles
+ 
 diff --git a/js/private/node-patches/fs.cjs b/js/private/node-patches/fs.cjs
-index acf3f797..05edbf9d 100644
+index acf3f797..629ff866 100644
 --- a/js/private/node-patches/fs.cjs
 +++ b/js/private/node-patches/fs.cjs
-@@ -46,6 +46,11 @@ const _fs = require('node:fs');
+@@ -46,7 +46,12 @@ const _fs = require('node:fs');
  const url = require('node:url');
  const HOP_NON_LINK = Symbol.for('HOP NON LINK');
  const HOP_NOT_FOUND = Symbol.for('HOP NOT FOUND');
+-function patcher(fs = _fs, roots) {
 +// TENZIN IMPORT SECTION
 +const { internalBinding } = require('internal/test/binding');
 +const { getStatsFromBinding } = require('internal/fs/utils');
 +const internalFs = internalBinding('fs');
 +const _originalStatFs = internalFs.lstat;
- function patcher(fs = _fs, roots) {
++function patcher(fs = _fs, roots, useLstatPatch) {
      fs = fs || _fs;
      // Make the original version of the library available for when access to the
+     // unguarded file system is necessary, such as the esbuild plugin that
 @@ -723,6 +728,115 @@ function patcher(fs = _fs, roots) {
              }
          }
@@ -90,7 +134,7 @@ index acf3f797..05edbf9d 100644
 +            throw err;
 +        }
 +    };
-+    if (internalFs.lstat) {
++    if (useLstatPatch && internalFs.lstat) {
 +        internalFs.lstat = function (path, bigint, reqCallback, throwIfNoEntry) {
 +            // This is the nasty part.. — but I didn't spend much time thinking on this. I do think it's acceptable though.
 +            // Better than escaping IMO
@@ -130,23 +174,47 @@ index acf3f797..05edbf9d 100644
  }
  exports.patcher = patcher;
  // =========================================================================
+diff --git a/js/private/node-patches/register.cjs b/js/private/node-patches/register.cjs
+index 944e576a..6636c8f3 100644
+--- a/js/private/node-patches/register.cjs
++++ b/js/private/node-patches/register.cjs
+@@ -5,6 +5,7 @@ const {
+     JS_BINARY__LOG_PREFIX,
+     JS_BINARY__NODE_WRAPPER,
+     JS_BINARY__PATCH_NODE_FS,
++    JS_BINARY__USE_LSTAT_PATCH,
+ } = process.env
+ 
+ // Keep a count of how many times these patches are applied; this should reflect the depth
+@@ -43,7 +44,8 @@ if (
+             `DEBUG: ${JS_BINARY__LOG_PREFIX}: node fs patches will be applied with roots: ${roots}`
+         )
+     }
+-    patchfs(fs, roots)
++    const useLstatPatch = JS_BINARY__USE_LSTAT_PATCH && JS_BINARY__USE_LSTAT_PATCH != '0'
++    patchfs(fs, roots, useLstatPatch)
+ 
+     // Sync the esm modules to use the now patched fs cjs module.
+     // See: https://nodejs.org/api/esm.html#builtin-modules
 diff --git a/js/private/node-patches/src/fs.cts b/js/private/node-patches/src/fs.cts
-index b07d4a1a..26ab6bea 100644
+index b07d4a1a..d551b9c6 100644
 --- a/js/private/node-patches/src/fs.cts
 +++ b/js/private/node-patches/src/fs.cts
-@@ -36,6 +36,12 @@ const HOP_NOT_FOUND = Symbol.for('HOP NOT FOUND')
+@@ -36,7 +36,13 @@ const HOP_NOT_FOUND = Symbol.for('HOP NOT FOUND')
  
  type HopResults = string | typeof HOP_NON_LINK | typeof HOP_NOT_FOUND
  
+-export function patcher(fs: any = _fs, roots: string[]) {
 +// TENZIN IMPORT SECTION
 +const { internalBinding } = require('internal/test/binding');
 +const { getStatsFromBinding } = require('internal/fs/utils');
 +const internalFs = internalBinding('fs');
 +const _originalStatFs = internalFs.lstat;
 +
- export function patcher(fs: any = _fs, roots: string[]) {
++export function patcher(fs: any = _fs, roots: string[], useLstatPatch: boolean) {
      fs = fs || _fs
      // Make the original version of the library available for when access to the
+     // unguarded file system is necessary, such as the esbuild plugin that
 @@ -819,6 +825,136 @@ export function patcher(fs: any = _fs, roots: string[]) {
              }
          }
@@ -238,7 +306,7 @@ index b07d4a1a..26ab6bea 100644
 +        }
 +    }
 +
-+    if (internalFs.lstat) {
++    if (useLstatPatch && internalFs.lstat) {
 +        internalFs.lstat = function (path, bigint, reqCallback, throwIfNoEntry) {
 +            // This is the nasty part.. — but I didn't spend much time thinking on this. I do think it's acceptable though.
 +            // Better than escaping IMO
