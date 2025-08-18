@@ -7,18 +7,38 @@ import { fileURLToPath, pathToFileURL } from 'url';
 // Import the escape detection logic from fs.cjs
 import { escapeFunction } from './fs.cjs';
 
-// Initialize escape detection with the same roots used by the fs patcher
-function initializeEscapeDetection() {
+function log(msg) {
+    console.log(`${msg}`);
+    fs.appendFileSync('/tmp/esm_hooks.log', `${msg}\n`);
+}
+
+function initializeRoots() {
     const rootsEnv = process.env.JS_BINARY__FS_PATCH_ROOTS;
     if (!rootsEnv) {
         return null;
     }
 
     const roots = rootsEnv.split(':').filter(root => fs.existsSync(root));
-    if (!roots.length) {
+    if (roots.length !== 2) {
+        log(`Got ${roots.length} roots from ${rootsEnv}, expected 2. roots=${roots}.`);
         return null;
     }
 
+    // By definition in `js/private/test/snapshots/launcher.sh`, first path should be
+    // the execroot, second is the runfiles. Naive algorithm we will apply is replace
+    // all paths that start with execroot with runfiles prefix instead.
+    log(`Initializing roots: ${roots}`);
+    return roots;
+}
+
+const roots = initializeRoots();
+
+// Initialize escape detection with the same roots used by the fs patcher
+function initializeEscapeDetection() {
+    if (!roots || !roots.length) {
+        return null;
+    }
+    log(`Initializing escape detection with roots: ${roots}`);
     return escapeFunction(roots);
 }
 
@@ -27,51 +47,44 @@ const escapeDetection = initializeEscapeDetection();
 export async function resolve(specifier, context, next) {
     const nextResult = await next(specifier, context);
 
-    console.log(`nextResult for ${specifier} ==> ${JSON.stringify(nextResult, null, 2)}`);
+    log(`nextResult for ${specifier} ==> ${JSON.stringify(nextResult, null, 2)}`);
 
     // Only process file:// URLs
     if (!nextResult.url.startsWith("file://")) {
-        console.log("Not a file:// URL, returning as-is");
+        log("Not a file:// URL, returning as-is");
         return nextResult;
     }
 
     // If escape detection is not available, return as-is
     if (!escapeDetection) {
-        console.log("Escape detection not available, returning as-is");
+        log("Escape detection not available, returning as-is");
         return nextResult;
     }
 
     // Convert the resolved URL to a file path
-    // NOTE(tenzin): Unfortunately by this point since the URL is already resolved, we don't have the
-    // original path with symlink :/ (darn). I think correct approach needs to be to copy the default
-    // resolve implementation and then just intercept the realpath call in finalize.
     const resolvedPath = fileURLToPath(nextResult.url);
 
-    // Use the unpatched realpath to get the actual file system path
-    let realPath;
-    try {
-        realPath = fs._unpatched.realpathSync(resolvedPath);
-    } catch (err) {
-        // If we can't resolve the path, return the original result
-        console.log(`Failed to resolve real path for ${resolvedPath}: ${err.message}`);
-        console.log("Returning as-is");
+    // If resolved URL is already within runfiles no work to do
+    if (resolvedPath.startsWith(roots[1])) {
+        log("Already within runfiles, returning as-is");
         return nextResult;
     }
 
-    // Check if this represents a sandbox escape
-    console.log(`Checking if ${resolvedPath} -> ${realPath} is an escape`);
-    const escapedRoot = escapeDetection.isEscape(resolvedPath, realPath);
-    if (escapedRoot) {
-        console.log("!!!!! Sandbox escape detected for " + specifier);
-        // Use the patched realpath to get the corrected path within the sandbox
-        const patchedPath = fs.realpathSync(resolvedPath);
-        const correctedUrl = pathToFileURL(patchedPath).href;
-
-        return {
-            ...nextResult,
-            url: correctedUrl
-        };
+    // Check if resolved URL is prefixed with execroot
+    if (!resolvedPath.startsWith(roots[0])) {
+        log("Not a workspace file, returning as-is");
+        return nextResult;
     }
 
-    return nextResult;
+    // Path starts with execroot prfix. Replace the execroot prefix with the runfiles prefix.
+    const runfilesPath = roots[1] + resolvedPath.slice(roots[0].length);
+
+    log(`Corrected path for ${specifier} ==> ${runfilesPath}`);
+
+    // Convert back to a URL and return
+    const correctedUrl = pathToFileURL(runfilesPath).href;
+    return {
+        ...nextResult,
+        url: correctedUrl
+    };
 }
