@@ -204,7 +204,7 @@ _ATTRS = {
         which can lead to non-hermetic behavior.""",
         default = True,
     ),
-    "use_lstat_patch": attr.bool(
+    "patch_node_esm_loader": attr.bool(
         doc = """Apply the internal lstat patch to prevent the program from following symlinks out of
         the execroot, runfiles and the sandbox even when using the ESM loader.
 
@@ -574,9 +574,9 @@ def _create_launcher(ctx, log_prefix_rule_set, log_prefix_rule, fixed_args = [],
 
 def _js_binary_impl(ctx):
     # Only apply lstat patch if it's requested
-    JS_BINARY__USE_LSTAT_PATCH = "1" if ctx.attr.use_lstat_patch else "0"
+    JS_BINARY__PATCH_NODE_ESM_LOADER = "1" if ctx.attr.patch_node_esm_loader else "0"
     fixed_env = {
-        "JS_BINARY__USE_LSTAT_PATCH": JS_BINARY__USE_LSTAT_PATCH,
+        "JS_BINARY__PATCH_NODE_ESM_LOADER": JS_BINARY__PATCH_NODE_ESM_LOADER,
     }
 
     launcher = _create_launcher(

@@ -46,11 +46,6 @@ const _fs = require('node:fs');
 const url = require('node:url');
 const HOP_NON_LINK = Symbol.for('HOP NON LINK');
 const HOP_NOT_FOUND = Symbol.for('HOP NOT FOUND');
-// TENZIN IMPORT SECTION
-const { internalBinding } = require('internal/test/binding');
-const { getStatsFromBinding } = require('internal/fs/utils');
-const internalFs = internalBinding('fs');
-const _originalStatFs = internalFs.lstat;
 function patcher(fs = _fs, roots, useLstatPatch) {
     fs = fs || _fs;
     // Make the original version of the library available for when access to the
@@ -79,7 +74,7 @@ function patcher(fs = _fs, roots, useLstatPatch) {
     const origRealpathSync = fs.realpathSync.bind(fs);
     const origRealpathSyncNative = fs.realpathSync
         .native;
-    const { canEscape, isEscape } = escapeFunction(roots);
+    const { isInBazelRoot, isEscape } = escapeFunction(roots);
     // =========================================================================
     // fs.lstat
     // =========================================================================
@@ -98,8 +93,9 @@ function patcher(fs = _fs, roots, useLstatPatch) {
                 return cb(null, stats);
             }
             args[0] = resolvePathLike(args[0]);
-            if (!canEscape(args[0])) {
-                // the file can not escaped the sandbox so there is nothing more to do
+            if (!isInBazelRoot(args[0])) {
+                // The requested path isn't within a bazel root to begin with so there's
+                // no "escaping" to fix.
                 return cb(null, stats);
             }
             return guardedReadLink(args[0], guardedReadLinkCb);
@@ -133,8 +129,9 @@ function patcher(fs = _fs, roots, useLstatPatch) {
             return stats;
         }
         args[0] = resolvePathLike(args[0]);
-        if (!canEscape(args[0])) {
-            // the file can not escaped the sandbox so there is nothing more to do
+        if (!isInBazelRoot(args[0])) {
+            // The requested path isn't within a bazel root to begin with so there's
+            // no "escaping" to fix.
             return stats;
         }
         const guardedReadLink = guardedReadLinkSync(args[0]);
@@ -269,14 +266,23 @@ function patcher(fs = _fs, roots, useLstatPatch) {
         const str = path.resolve(path.dirname(resolved), origReadlinkSync(...args));
         const escapedRoot = isEscape(resolved, str);
         if (escapedRoot) {
+            // The symlink escapes the root, but maybe if we resolve other
+            // symlinks in the path we can get back into the root, so let's
+            // try to take another hop preferring one that keeps us in the
+            // sandbox. (NOTE(tenzin): I'm not sure why this would ever be the case).
             let next = nextHopSync(str);
             if (!next) {
+                // The escape from the root is not mappable back into the root
+                // NOTE(tenzin): I think technically both of these branches
+                // should be unreachable, since if we were able to resolve the
+                // symlink with `origReadlinkSync`, it should both be a defined
+                // file and have symlink path elements. This code seems strange.
                 if (next == undefined) {
-                    // The escape from the root is not mappable back into the root; throw EINVAL
+                    // `str` isn't even a valid path to a file; throw ENOENT
                     throw enoent('readlink', args[0]);
                 }
                 else {
-                    // The escape from the root is not mappable back into the root; throw EINVAL
+                    // `str` is not a symlink; throw EINVAL
                     throw einval('readlink', args[0]);
                 }
             }
@@ -285,6 +291,8 @@ function patcher(fs = _fs, roots, useLstatPatch) {
                 return next;
             }
             // The escape from the root is not mappable back into the root; throw EINVAL
+            // In the case of the file existing, this is equivalent to telling the caller
+            // the file is not a symbolic link (this is how we keep things contained to the roots).
             throw einval('readlink', args[0]);
         }
         return str;
@@ -523,6 +531,12 @@ function patcher(fs = _fs, roots, useLstatPatch) {
         });
     }
     const hopLinkCache = Object.create(null);
+    /**
+     * Read the contents of the symlink located at path p.
+     *
+     * If the file does not exist, returns HOP_NOT_FOUND.
+     * If the file is not a symlink, returns HOP_NON_LINK.
+     */
     function readHopLinkSync(p) {
         if (hopLinkCache[p]) {
             return hopLinkCache[p];
@@ -584,36 +598,85 @@ function patcher(fs = _fs, roots, useLstatPatch) {
             cb(link);
         });
     }
+    /**
+     * Takes one hop in symlink traversal (i.e.: at most one symlink in a path is resolved, and only
+     * resolved one step).
+     *
+     * For each return condition, resolves the "rightmost" symlink e.g. if
+     * resolving `/a/b/c`, where `/a/b` -> `../d` and `a/b/c` -> `../f` then in
+     * theory you could take two possible hops, either `/a/b/c` -> `/a/d/c` or
+     * `/a/b/c` -> `/a/b/f` (both would resolve to the same file). Assuming
+     * neither are escapes (or both are), this function returns `/a/b/f` (breaks
+     * ties by resolving the rightmost hop).
+     *
+     * However, note that if it were something like `c` -> `/g`, `/a` is our only root,
+     * then we would return `/a/d/c` (as it is not an escape, whereas `/g` is).
+     *
+     * The way most downstream consumers use this in the context of preventing sandbox escapes
+     * is to resolve as many symlink hops as possible that do NOT escape the sandbox, then
+     * on the first hop that does, just return the path of the symlink itself.
+     *
+     * Returns:
+     * - If we can resolve a symlink that does not lead to an escape: returns the new target path.
+     * - If the only available symlink(s) lead to an escape: returns the target path of resolving the
+     *  rightmost symlink.
+     * - If there are no symlinks to resolve: returns false.
+     * - If `loc` is not a valid path (no file at that path): returns undefined.
+     */
     function nextHopSync(loc) {
+        // Loop invariant: maybe + nested = loc
+        // i.e.: nested tracks the segments of the path that have been "consumed" as we traverse up the directory tree.
         let nested = '';
+        // Path of current file we're evaluating (could be a dir or symlink, "file" in the linux sense).
+        // maybe traverses up the directory tree each loop iteration until a termination condition is hit:
+        // /a/b/c -> /a/b -> /a -> /
         let maybe = loc;
+        // Stores the first target path that escaped the root.
         let escapedHop = false;
         for (;;) {
             let link = readHopLinkSync(maybe);
             if (link === HOP_NOT_FOUND) {
+                // maybe points to a non-existent file
                 return undefined;
             }
             if (link !== HOP_NON_LINK) {
+                // `maybe` is a symlink targeting `link`.
                 if (nested) {
+                    // Re-add the child path components to the target path.
+                    // e.g.: If loc was /a/b/c and /a/b is a symlink targeting /d, then /a/b/c
+                    // should resolve to /d/c, so link = /d/c after this line.
                     link = link + path.sep + nested;
                 }
                 if (!isEscape(loc, link)) {
+                    // This symlink is not an escape, return the target path.
                     return link;
                 }
+                // This symlink is an escape.
                 if (!escapedHop) {
+                    // This symlink is the first escape we've encountered.
+                    // Record the target.
                     escapedHop = link;
                 }
             }
+            // At this point the following cases:
+            // - maybe is not a symlink
+            // - maybe is a symlink that escapes the root
+            // dirname stores the parent dir of current candidate path.
             const dirname = path.dirname(maybe);
             if (!dirname ||
+                // This should catch terminal conditions when maybe is like:
+                // "/", ".", or "C:"
                 dirname == maybe ||
                 dirname == '.' ||
                 dirname == '/') {
-                // not a link
+                // We have traversed up the parent directories, return the
+                // first escape we encountered.
                 return escapedHop;
             }
             nested = path.basename(maybe) + (nested ? path.sep + nested : '');
+            // Go up the directory tree, try parent dir as next potential link.
             maybe = dirname;
+            // Loop invariant restored: maybe + nested = loc
         }
     }
     function guardedReadLink(start, cb) {
@@ -632,12 +695,21 @@ function patcher(fs = _fs, roots, useLstatPatch) {
             return cb(next);
         }
     }
+    /**
+     * Takes one hop in symlink traversal (preferring hops that don't escape),
+     * and returns the target of the symlink if it does not escape the sandbox.
+     * Or: returns the symlink path itself if it escapes the sandbox.
+     *
+     * If the next hop would escape the sandbox, returns `start`.
+     * If `start` is not a symlink (nor has any symlink components), returns `start`.
+     */
     function guardedReadLinkSync(start) {
         let loc = start;
         let next = nextHopSync(loc);
         if (!next) {
             // we're no longer hopping but we haven't escaped;
             // something funky happened in the filesystem
+            // Or we were passed a non-symlink/non-existent file.
             return loc;
         }
         if (isEscape(loc, next)) {
@@ -691,6 +763,9 @@ function patcher(fs = _fs, roots, useLstatPatch) {
         }
         oneHop(start, cb);
     }
+    /**
+     * Fully resolves all symlinks in a path, (theoretically equivalent to intrinsic `realpath`).
+     */
     function unguardedRealPathSync(start) {
         start = stringifyPathLike(start); // handle the "undefined" case (matches behavior as fs.realpathSync)
         for (let loc = start, next;; loc = next) {
@@ -705,6 +780,11 @@ function patcher(fs = _fs, roots, useLstatPatch) {
             }
         }
     }
+    /**
+     * "Guarded" realpath implementation.
+     *
+     * This means it traverses all symlinks that do not lead to an escape, then returns the path.
+     */
     function guardedRealPathSync(start, escapedRoot = undefined) {
         start = stringifyPathLike(start); // handle the "undefined" case (matches behavior as fs.realpathSync)
         for (let loc = start, next;; loc = next) {
@@ -728,114 +808,170 @@ function patcher(fs = _fs, roots, useLstatPatch) {
             }
         }
     }
-    // TENZIN PATCH SECTION FOR NODE INTERNAL LSTAT BINDING
-    // Almost same logic as existing patcher, just that we use `getStatsFromBinding`.
-    const eeguardStats = (path, bigint, stats, cb) => {
-        const statsObj = getStatsFromBinding(stats);
-        if (!statsObj.isSymbolicLink()) {
-            // the file is not a symbolic link so there is nothing more to do
-            return cb(null, stats);
+    // OUR PATCH SECTION FOR NODE INTERNAL LSTAT BINDING
+    // All credit goes to `devversion` on Github for sharing the patch solution:
+    // https://github.com/aspect-build/rules_js/issues/362#issuecomment-2950303149
+    if (useLstatPatch) {
+        // We guard the `require` statements to avoid triggering the warning message
+        // when the patch isn't enabled.
+        const { internalBinding } = require('internal/test/binding');
+        const { getStatsFromBinding } = require('internal/fs/utils');
+        const internalFs = internalBinding('fs');
+        const _originalLStatFsInternal = internalFs.lstat;
+        // Implementation
+        function _originalLStatFs(...args) {
+            return _originalLStatFsInternal(...args);
         }
-        path = resolvePathLike(path);
-        if (!canEscape(path)) {
-            // the file can not escaped the sandbox so there is nothing more to do
-            return cb(null, stats);
+        const _originalStatFsInternal = internalFs.stat;
+        function _originalStatFs(...args) {
+            return _originalStatFsInternal(...args);
         }
-        return guardedReadLink(path, (str) => {
-            if (str != path) {
-                // there are one or more hops within the guards so there is nothing more to do
-                return cb(null, stats);
-            }
-            // there are no hops so lets report the stats of the real file;
-            // we can't use origRealPath here since that function calls lstat internally
-            // which can result in an infinite loop
-            return unguardedRealPath(path, (err, str) => {
-                if (err) {
-                    if ('code' in err && err.code === 'ENOENT') {
-                        // broken link so there is nothing more to do
+        if (internalFs.lstat) {
+            // Almost same logic as existing patcher, just that we use `getStatsFromBinding`.
+            /**
+             * Guard the stats object returned from the internal lstat call (called as a shim layer on the result returned from the internal lstat call).
+             */
+            const guardInternalStats = (path, bigint, stats, cb) => {
+                const statsObj = getStatsFromBinding(stats);
+                if (!statsObj.isSymbolicLink()) {
+                    // the file is not a symbolic link so there is nothing more to do
+                    return cb(null, stats);
+                }
+                path = resolvePathLike(path);
+                if (!isInBazelRoot(path)) {
+                    // The file didn't start in a bazel root, so no escaping to fix.
+                    return cb(null, stats);
+                }
+                return guardedReadLink(path, (str) => {
+                    if (str != path) {
+                        // there are one or more hops within the guards so there is nothing more to do
                         return cb(null, stats);
                     }
-                    return cb(err);
-                }
-                // Forward request to original callback.
-                const req2 = new internalFs.FSReqCallback(bigint);
-                req2.oncomplete = (err, realStats) => cb(err, realStats);
-                return _originalStatFs.call(internalFs, str, bigint, req2);
-            });
-        });
-    };
-    // Almost same logic as existing patcher, just that we use `getStatsFromBinding`.
-    const eeguardStatsSync = (path, bigint, throwIfNoEntry, stats) => {
-        // No stats available.
-        if (!stats) {
-            return stats;
-        }
-        const statsObj = getStatsFromBinding(stats);
-        if (!statsObj.isSymbolicLink()) {
-            // the file is not a symbolic link so there is nothing more to do
-            return stats;
-        }
-        path = resolvePathLike(path);
-        if (!canEscape(path)) {
-            // the file can not escaped the sandbox so there is nothing more to do
-            return stats;
-        }
-        const guardedReadLink = guardedReadLinkSync(path);
-        if (guardedReadLink != path) {
-            // there are one or more hops within the guards so there is nothing more to do
-            return stats;
-        }
-        try {
-            path = unguardedRealPathSync(path);
-            // there are no hops so lets report the stats of the real file;
-            // we can't use origRealPathSync here since that function calls lstat internally
-            // which can result in an infinite loop
-            return _originalStatFs.call(internalFs, path, bigint, undefined, throwIfNoEntry);
-        }
-        catch (err) {
-            if (err.code === 'ENOENT') {
-                // broken link so there is nothing more to do
-                return stats;
-            }
-            throw err;
-        }
-    };
-    if (useLstatPatch && internalFs.lstat) {
-        internalFs.lstat = function (path, bigint, reqCallback, throwIfNoEntry) {
-            // This is the nasty part.. — but I didn't spend much time thinking on this. I do think it's acceptable though.
-            // Better than escaping IMO
-            const st = new Error().stack;
-            const needsGuarding = st.includes('finalizeResolution (node:internal/modules/esm/resolve') && !st.includes('eeguardStats');
-            if (!needsGuarding || global.__insidePatchedLstat) {
-                return _originalStatFs
-                    .call(internalFs, path, bigint, reqCallback, throwIfNoEntry);
-            }
-            if (typeof reqCallback === 'symbol') {
-                return _originalStatFs
-                    .call(internalFs, path, bigint, reqCallback, throwIfNoEntry)
-                    .then((stats) => {
-                    return new Promise((resolve, reject) => {
-                        eeguardStats(path, bigint, stats, (err, guardedStats) => {
-                            err ? reject(err) : resolve(guardedStats);
-                        });
+                    // there are no hops so lets report the stats of the real file;
+                    // we can't use origRealPath here since that function calls lstat internally
+                    // which can result in an infinite loop
+                    return unguardedRealPath(path, (err, realPath) => {
+                        if (err) {
+                            if (err.code === 'ENOENT') {
+                                // broken link so there is nothing more to do
+                                return cb(null, stats);
+                            }
+                            return cb(err, null);
+                        }
+                        // Call _originalStatFs on the real path to get the actual file stats
+                        // We use stat (not lstat) because we want the stats of the target file.
+                        const statReq = new internalFs.FSReqCallback(bigint);
+                        statReq.oncomplete = (err, realStats) => {
+                            if (err) {
+                                if (err.code === 'ENOENT') {
+                                    // broken link so there is nothing more to do
+                                    return cb(null, stats);
+                                }
+                                return cb(err, null);
+                            }
+                            return cb(null, realStats);
+                        };
+                        return _originalStatFs(realPath, bigint, statReq);
                     });
                 });
-            }
-            else if (reqCallback !== undefined) {
-                // Just re-use the promise path above.
-                internalFs
-                    .lstat(path, bigint, internalFs.kUsePromises, throwIfNoEntry)
-                    .then((stats) => reqCallback(null, stats))
-                    .catch((err) => reqCallback(err));
-            }
-            else {
-                const stats = _originalStatFs.call(internalFs, path, bigint, undefined, throwIfNoEntry);
+            };
+            /**
+             * Guard the stats object returned from the internal lstat call (called as a shim layer on the result returned from the internal lstat call).
+             */
+            // Almost same logic as existing patcher, just that we use `getStatsFromBinding`.
+            const guardInternalStatsSync = (path, bigint, throwIfNoEntry, stats) => {
+                // No stats available.
                 if (!stats) {
                     return stats;
                 }
-                return eeguardStatsSync(path, bigint, throwIfNoEntry, stats);
-            }
-        };
+                const statsObj = getStatsFromBinding(stats);
+                if (!statsObj.isSymbolicLink()) {
+                    // the file is not a symbolic link so there is nothing more to do
+                    return stats;
+                }
+                path = resolvePathLike(path);
+                if (!isInBazelRoot(path)) {
+                    // The path isn't within a bazel root so there's technically no "escape" to fix.
+                    // e.g.: if program tries to access `/tmp` we don't want to patch that.
+                    return stats;
+                }
+                const guardedReadLink = guardedReadLinkSync(path);
+                if (guardedReadLink != path) {
+                    // There are one or more hops within the guards so we are safe to let the
+                    // caller know it's a symlink (as even if they follow it they'll be within
+                    // sandbox).
+                    return stats;
+                }
+                try {
+                    // There are no hops so lets report the stats of the real file since
+                    // lstat on a normal file should return the what stat would;
+                    // We can just call `stat` directly since it resolves symlinks (which is
+                    // what we want here).
+                    return _originalStatFs(path, bigint, undefined, throwIfNoEntry);
+                }
+                catch (err) {
+                    if (err.code === 'ENOENT') {
+                        // broken link so there is nothing more to do
+                        return stats;
+                    }
+                    throw err;
+                }
+            };
+            internalFs.lstat = function (path, bigint, reqCallbackOrUsePromises, throwIfNoEntry) {
+                // NOTE(tenzin): This is a very targeted/hacky way to check if
+                // we should apply guarding that comes from the original patch.
+                // Also the check against whether the stack trace includes eeguardStats
+                // seems unnecessary for correctness (in theory our patch should only ever call
+                // into the internal fs functions, which should never themselves
+                // call eeguardStats. And even if the passed callback references
+                // a patched fs function, the stack trace should no longer
+                // include the eeguardStats function, because it would've been
+                // popped off stack by the time callback is invoked).
+                const st = new Error().stack;
+                const inFinalizeResolution = st.includes('finalizeResolution (node:internal/modules/esm/resolve');
+                const inGuardInternalStats = st.includes('guardInternalStats');
+                // For both correctness and speed we only apply guarding logic when
+                // we're inside of the ESM resolver's finalizeResolution function (which
+                // is the one that calls realpath to escape the sandbox). When we removed
+                // the guarding the patch was both slower, and incorrect (e2e demo test
+                // would fail). I think this is because without the guard we can end up
+                // in cases where patched fs.lstat calls patched internalFs.lstat, which
+                // is not the semantics that the patched fs.lstat expects.
+                const needsGuarding = inFinalizeResolution && !inGuardInternalStats;
+                if (!needsGuarding) {
+                    return _originalLStatFs.call(internalFs, path, bigint, reqCallbackOrUsePromises, throwIfNoEntry);
+                }
+                if (typeof reqCallbackOrUsePromises === 'symbol') {
+                    const usePromises = reqCallbackOrUsePromises;
+                    return _originalLStatFs
+                        .call(internalFs, path, bigint, usePromises, throwIfNoEntry)
+                        .then((stats) => {
+                        return new Promise((resolve, reject) => {
+                            guardInternalStats(path, bigint, stats, (err, guardedStats) => {
+                                err
+                                    ? reject(err)
+                                    : resolve(guardedStats);
+                            });
+                        });
+                    });
+                }
+                else if (reqCallbackOrUsePromises !== undefined) {
+                    const reqCallback = reqCallbackOrUsePromises;
+                    // Just re-use the promise path above.
+                    internalFs
+                        .lstat(path, bigint, internalFs.kUsePromises, throwIfNoEntry)
+                        .then((stats) => reqCallback.oncomplete(null, stats))
+                        .catch((err) => reqCallback.oncomplete(err, undefined));
+                }
+                else {
+                    const stats = _originalLStatFs.call(internalFs, path, bigint, undefined, throwIfNoEntry);
+                    if (!stats) {
+                        return stats;
+                    }
+                    return guardInternalStatsSync(path, bigint, throwIfNoEntry, stats);
+                }
+            };
+        }
     }
 }
 exports.patcher = patcher;
@@ -874,6 +1010,18 @@ function escapeFunction(_roots) {
     const defaultRoots = _roots
         .map((root) => path.resolve(root))
         .sort((a, b) => b.length - a.length);
+    /**
+     * Detects whether a symlink escapes the provided roots (given the symlinks
+     * path and its target path).
+     *
+     * A symlink is considered an escape when the symlink is within a root but the
+     * target is not.
+     *
+     * If it's not an escape, returns false.
+     *
+     * If it is an escape, returns the first root that the symlink is within (using
+     * the defaultRoots this should be the most specific root that matched).
+     */
     function fs_isEscape(linkPath, linkTarget, roots = defaultRoots) {
         // linkPath is the path of the symlink file itself
         // linkTarget is a path that the symlink points to one or more hops away
@@ -887,7 +1035,13 @@ function escapeFunction(_roots) {
         }
         return false;
     }
-    function fs_canEscape(maybeLinkPath, roots = defaultRoots) {
+    /**
+     * Returns true if the path is within one of the provided bazel roots.
+     *
+     * By default the roots are the execroot (may be sandboxed) and runfiles root
+     * (runfiles root should always be subpath of execroot).
+     */
+    function fs_isInBazelRoot(maybeLinkPath, roots = defaultRoots) {
         // maybeLinkPath is the path which may be a symlink
         // maybeLinkPath must already be normalized
         for (const root of roots) {
@@ -900,7 +1054,7 @@ function escapeFunction(_roots) {
     }
     return {
         isEscape: fs_isEscape,
-        canEscape: fs_canEscape,
+        isInBazelRoot: fs_isInBazelRoot,
     };
 }
 exports.escapeFunction = escapeFunction;

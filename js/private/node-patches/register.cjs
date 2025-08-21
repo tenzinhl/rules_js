@@ -5,7 +5,7 @@ const {
     JS_BINARY__LOG_PREFIX,
     JS_BINARY__NODE_WRAPPER,
     JS_BINARY__PATCH_NODE_FS,
-    JS_BINARY__USE_LSTAT_PATCH,
+    JS_BINARY__PATCH_NODE_ESM_LOADER,
 } = process.env
 
 // Keep a count of how many times these patches are applied; this should reflect the depth
@@ -44,7 +44,7 @@ if (
             `DEBUG: ${JS_BINARY__LOG_PREFIX}: node fs patches will be applied with roots: ${roots}`
         )
     }
-    const useLstatPatch = JS_BINARY__USE_LSTAT_PATCH && JS_BINARY__USE_LSTAT_PATCH != '0'
+    const useLstatPatch = JS_BINARY__PATCH_NODE_ESM_LOADER && JS_BINARY__PATCH_NODE_ESM_LOADER != '0'
     patchfs(fs, roots, useLstatPatch)
 
     // Sync the esm modules to use the now patched fs cjs module.
